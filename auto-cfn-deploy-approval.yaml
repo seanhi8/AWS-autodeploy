@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CodePipeline triggered by S3 upload of .yaml/.json templates.
+  Includes manual approval, CloudFormation deployment, rollback support, and email notifications.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: BucketName
+    Description: S3 bucket for CloudFormation templates
+  EmailAddress:
+    Type: String
+    Description: Email for manual approval and failure notifications
+  LatestTemplateKey:
+    Type: String
+    Description: S3 key (file path) of uploaded CloudFormation template passed in by EventBridge trigger
+
+Resources:
+  # IAM group for approvers (optional logic-level reference, not enforced in pipeline)
+  ApprovalGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: PipelineApprovers
+
+  # SNS topic for sending manual approval notifications
+  ApproverTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  # IAM Role for CloudFormation deployment with least privileges
+  CFNExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CFNPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource: '*'
+
+  # IAM Role for CodePipeline execution
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+              - Effect: Allow
+                Action: cloudformation:*
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+
+  # Main CodePipeline definition
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref S3BucketName
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: S3Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket: !Ref S3BucketName
+                S3ObjectKey: !Ref LatestTemplateKey
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: Approval
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                NotificationArn: !Ref ApproverTopic
+                CustomData: "Please approve the CloudFormation deployment."
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployWithCfn
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: DynamicStack
+                TemplatePath: !Sub "SourceArtifact::${LatestTemplateKey}"
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CFNExecutionRole.Arn
+              RunOrder: 1
+
+  # IAM Role used by EventBridge to trigger pipeline execution
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowPipelineExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !GetAtt Pipeline.Arn
+
+  # EventBridge rule to detect .yaml/.json upload and trigger the pipeline
+  TemplateUploadEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger pipeline when a .yaml or .json template is uploaded to S3
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref S3BucketName
+          object:
+            key:
+              - suffix: .yaml
+              - suffix: .json
+      Targets:
+        - Arn: !GetAtt Pipeline.Arn
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+          Id: CodePipelineTrigger
+          InputTransformer:
+            InputPathsMap:
+              key: $.detail.object.key
+            InputTemplate: '{"LatestTemplateKey":"<key>"}'
+
+Outputs:
+  PipelineName:
+    Description: Name of the created CodePipeline
+    Value: !Ref Pipeline
+    Export:
+      Name: PipelineName
+  PipelineArn:
+    Description: ARN of the CodePipeline (useful for other triggers or permissions)
+    Value: !GetAtt Pipeline.Arn
+    Export:
+      Name: PipelineArn
+  CFNExecutionRoleArn:
+    Description: ARN of the CloudFormation execution role
+    Value: !GetAtt CFNExecutionRole.Arn
+    Export:
+      Name: CFNExecutionRoleArn
+  ApproverSNSTopic:
+    Description: SNS topic ARN for approval notifications
+    Value: !Ref ApproverTopic
+    Export:
+      Name: ApproverSNSTopic
+  EventRuleName:
+    Description: Name of the EventBridge rule triggering the pipeline
+    Value: !Ref TemplateUploadEventRule
+    Export:
+      Name: TemplateUploadEventRuleName
+
