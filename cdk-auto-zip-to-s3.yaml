@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Detects .yaml or .json upload to S3, generates CDK package (TypeScript or Python) via Lambda, 
+  and saves result to s3://<bucket>/cdk_zip/.
+
+Parameters:
+  TargetBucket:
+    Type: String
+    Description: S3 bucket where templates are uploaded and output zip is saved
+  CDKLanguage:
+    Type: String
+    Description: CDK output language to use when converting templates
+    AllowedValues:
+      - TypeScript
+      - Python
+    Default: TypeScript
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cdk-generator-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${TargetBucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  CDKGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: generate-cdk-package
+      Runtime: nodejs18.x
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const path = require('path');
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          exports.handler = async (event) => {
+            const bucket = event.Records[0].s3.bucket.name;
+            const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+            const tmpPath = `/tmp/template.yaml`;
+            const zipOutput = `/tmp/cdk_output.zip`;
+            const lang = process.env.CDK_LANGUAGE || 'TypeScript';
+
+            // Download template
+            const data = await s3.getObject({ Bucket: bucket, Key: key }).promise();
+            fs.writeFileSync(tmpPath, data.Body);
+
+            const projectDir = '/tmp/cdk-app';
+            fs.mkdirSync(projectDir);
+            fs.writeFileSync(`${projectDir}/README.md`, `# Auto-generated CDK app from ${key}`);
+
+            // Generate CDK template (simplified stub example)
+            const appTs = `
+              import * as cdk from 'aws-cdk-lib';
+              import { Stack, StackProps } from 'aws-cdk-lib';
+              import { Construct } from 'constructs';
+
+              class GeneratedStack extends Stack {
+                constructor(scope: Construct, id: string, props?: StackProps) {
+                  super(scope, id, props);
+                  // TODO: parse and convert original template
+                }
+              }
+
+              const app = new cdk.App();
+              new GeneratedStack(app, 'GeneratedStack');
+            `;
+
+            if (lang === 'TypeScript') {
+              fs.mkdirSync(`${projectDir}/bin`, { recursive: true });
+              fs.writeFileSync(`${projectDir}/bin/app.ts`, appTs);
+              fs.writeFileSync(`${projectDir}/tsconfig.json`, JSON.stringify({
+                compilerOptions: { target: "ES2020", module: "commonjs" }
+              }));
+              fs.writeFileSync(`${projectDir}/package.json`, JSON.stringify({
+                name: "generated-cdk-app",
+                dependencies: {
+                  "aws-cdk-lib": "^2.0.0",
+                  "constructs": "^10.0.0"
+                }
+              }));
+            } else {
+              fs.writeFileSync(`${projectDir}/app.py`, "# TODO: Python CDK generation");
+            }
+
+            execSync(`cd ${projectDir} && zip -r ${zipOutput} .`);
+
+            const uploadKey = `cdk_zip/${path.basename(key)}.zip`;
+            await s3.putObject({
+              Bucket: bucket,
+              Key: uploadKey,
+              Body: fs.readFileSync(zipOutput),
+            }).promise();
+
+            return { status: 'done', output: uploadKey };
+          }
+      Environment:
+        Variables:
+          CDK_LANGUAGE: !Ref CDKLanguage
+
+  CDKUploadTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Lambda when .yaml or .json is uploaded
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name: 
+              - !Ref TargetBucket
+          object:
+            key:
+              - suffix: .yaml
+              - suffix: .json
+      Targets:
+        - Arn: !GetAtt CDKGeneratorFunction.Arn
+          Id: LambdaTrigger
+          RoleArn: !GetAtt EventInvokeRole.Arn
+
+  EventInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cdk-generator-event-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CDKGeneratorFunction.Arn
+
+Outputs:
+  GeneratorFunctionArn:
+    Value: !GetAtt CDKGeneratorFunction.Arn
+    Description: ARN of the Lambda function that converts templates to CDK packages
+  OutputPrefix:
+    Value: !Sub s3://${TargetBucket}/cdk_zip/
+    Description: Path where generated CDK zip packages are saved
