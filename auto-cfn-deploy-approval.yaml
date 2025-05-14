@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  CodePipeline triggered by S3 upload of .yaml/.json templates.
-  Includes manual approval, CloudFormation deployment, rollback support, and email notifications.
+  CodePipeline triggered by S3 upload of .yaml/.json templates with enhanced error handling and notifications.
+  Includes manual approval, CloudFormation deployment, rollback support, email notifications, and Lambda-based Change Set summary notifications.
 
 Parameters:
   S3BucketName:
@@ -11,24 +11,86 @@ Parameters:
   EmailAddress:
     Type: String
     Description: Email for manual approval and failure notifications
-  LatestTemplateKey:
+  ApprovalGroupName:
     Type: String
-    Description: S3 key (file path) of uploaded CloudFormation template passed in by EventBridge trigger
+    Default: PipelineApprovers
+    Description: IAM group name for the approvers
+  TopicName:
+    Type: String
+    Default: CodePipelineApprovalTopic
+    Description: SNS Topic name for approval notifications
+  PipelineName:
+    Type: String
+    Default: AutoCfnPipeline
+    Description: Name of the CodePipeline
+  EventRuleName:
+    Type: String
+    Default: TemplateUploadEventRule
+    Description: EventBridge rule name to trigger pipeline
 
 Resources:
+  # S3 Bucket for CloudFormation templates
+  TemplateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 90
+            Prefix: Template/
+
   # IAM group for approvers (optional logic-level reference, not enforced in pipeline)
   ApprovalGroup:
     Type: AWS::IAM::Group
     Properties:
-      GroupName: PipelineApprovers
+      GroupName: !Ref ApprovalGroupName
 
   # SNS topic for sending manual approval notifications
   ApproverTopic:
     Type: AWS::SNS::Topic
     Properties:
+      TopicName: !Ref TopicName
       Subscription:
         - Endpoint: !Ref EmailAddress
           Protocol: email
+
+  # Lambda function to notify change set summary
+  LambdaChangeSetNotifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: NotifyChangeSetSummary
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: lambda/code/changeSetNotifier.zip
+      Runtime: python3.8
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref ApproverTopic
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaChangeSetNotifierPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeChangeSet
+                  - sns:Publish
+                Resource: '*'
 
   # IAM Role for CloudFormation deployment with least privileges
   CFNExecutionRole:
@@ -104,7 +166,7 @@ Resources:
                 Version: 1
               Configuration:
                 S3Bucket: !Ref S3BucketName
-                S3ObjectKey: !Ref LatestTemplateKey
+                S3ObjectKey: !Sub 'Template/${EventBridgeTriggerKey}'
                 PollForSourceChanges: false
               OutputArtifacts:
                 - Name: SourceArtifact
@@ -134,9 +196,22 @@ Resources:
               Configuration:
                 ActionMode: CREATE_UPDATE
                 StackName: DynamicStack
-                TemplatePath: !Sub "SourceArtifact::${LatestTemplateKey}"
+                TemplatePath: !Sub "SourceArtifact::Template/${EventBridgeTriggerKey}"
                 Capabilities: CAPABILITY_NAMED_IAM
                 RoleArn: !GetAtt CFNExecutionRole.Arn
+              RunOrder: 1
+
+        - Name: NotifyChangeSetSummary
+          Actions:
+            - Name: NotifyChangeSet
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              Configuration:
+                FunctionName: !Ref LambdaChangeSetNotifier
+                UserParameters: '{"ChangeSetName": "${ChangeSetName}", "StackName": "DynamicStack"}'
               RunOrder: 1
 
   # IAM Role used by EventBridge to trigger pipeline execution
@@ -175,6 +250,7 @@ Resources:
               - !Ref S3BucketName
           object:
             key:
+              - prefix: Template/
               - suffix: .yaml
               - suffix: .json
       Targets:
@@ -184,7 +260,7 @@ Resources:
           InputTransformer:
             InputPathsMap:
               key: $.detail.object.key
-            InputTemplate: '{"LatestTemplateKey":"<key>"}'
+            InputTemplate: '{"EventBridgeTriggerKey":"<key>"}'
 
 Outputs:
   PipelineName:
@@ -212,4 +288,3 @@ Outputs:
     Value: !Ref TemplateUploadEventRule
     Export:
       Name: TemplateUploadEventRuleName
-
