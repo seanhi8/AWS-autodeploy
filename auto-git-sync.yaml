@@ -1,0 +1,82 @@
+本模板部署在 A 账号中，实现当 A 账号的 prod 分支变更并获批准后，同步到 B 账号的 prod 分支。
+
+同步使用 B 账号中 Git 用户的 Access Key 认证方式，避免明文用户名密码。
+
+AWSTemplateFormatVersion: '2010-09-09' Description: 同步 A 账号 CodeCommit prod 分支到 B 账号，并要求批准（通过 GitApproval 用户组）
+
+Parameters:
+
+A账号参数
+
+RepositoryAName: Type: String Description: A账号中的源 CodeCommit 仓库名称
+
+B账号参数
+
+RepositoryBName: Type: String Description: B账号中的目标 CodeCommit 仓库名称
+
+BRepoAccessKeyId: Type: String Description: B账号中具备 CodeCommit push 权限的 IAM 用户的 Access Key ID NoEcho: true
+
+BRepoSecretAccessKey: Type: String Description: B账号中具备 CodeCommit push 权限的 IAM 用户的 Secret Access Key NoEcho: true
+
+BGitRegion: Type: String Description: B账号的目标区域 Default: ap-northeast-1
+
+DeploymentRegions: Type: CommaDelimitedList Description: 默认部署区域，格式如：ap-northeast-1,ap-northeast-3 Default: ap-northeast-1,ap-northeast-3
+
+SourceBranch: Type: String Description: 源分支名（触发同步的分支）
+
+Resources:
+
+IAM 用户组：GitApproval
+
+GitApprovalGroup: Type: AWS::IAM::Group Properties: GroupName: GitApproval
+
+Artifact 存储桶
+
+ArtifactBucket: Type: AWS::S3::Bucket Properties: BucketName: !Sub codepipeline-artifact-${AWS::StackName}-${AWS::Region}
+
+日志组（CodeBuild 输出日志，保留 180 天）
+
+SyncBuildLogGroup: Type: AWS::Logs::LogGroup Properties: LogGroupName: !Sub /aws/codebuild/sync-to-b-${AWS::StackName} RetentionInDays: 180
+
+CodeBuild 项目：用于将 A 的 prod 分支推送到 B
+
+SyncBuildProject: Type: AWS::CodeBuild::Project Properties: Name: !Sub sync-to-b-${AWS::StackName} Source: Type: CODEPIPELINE Environment: Type: LINUX_CONTAINER ComputeType: BUILD_GENERAL1_SMALL Image: aws/codebuild/standard:7.0 EnvironmentVariables: - Name: B_ACCESS_KEY_ID Value: !Ref BRepoAccessKeyId - Name: B_SECRET_ACCESS_KEY Value: !Ref BRepoSecretAccessKey - Name: RepositoryAName Value: !Ref RepositoryAName - Name: RepositoryBName Value: !Ref RepositoryBName - Name: Region Value: !Ref BGitRegion ServiceRole: !GetAtt SyncBuildRole.Arn Artifacts: Type: CODEPIPELINE TimeoutInMinutes: 10 LogsConfig: CloudWatchLogs: Status: ENABLED GroupName: !Ref SyncBuildLogGroup StreamName: !Sub sync-log-stream-${AWS::StackName} BuildSpec: | version: 0.2 phases: install: runtime-versions: python: 3.9 commands: - apt-get update && apt-get install -y git - pip install awscli pre_build: commands: - export AWS_ACCESS_KEY_ID=${B_ACCESS_KEY_ID} - export AWS_SECRET_ACCESS_KEY=${B_SECRET_ACCESS_KEY} - git config --global credential.helper '!aws codecommit credential-helper $@' - git config --global credential.UseHttpPath true build: commands: - git clone --branch ${SourceBranch} https://git-codecommit.${Region}.amazonaws.com/v1/repos/${RepositoryAName} repo - cd repo - git remote add target https://git-codecommit.${Region}.amazonaws.com/v1/repos/${RepositoryBName} - git push --force target prod
+
+CodeBuild 角色
+
+SyncBuildRole: Type: AWS::IAM::Role Properties: RoleName: !Sub codebuild-sync-role-${AWS::StackName} AssumeRolePolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Principal: Service: codebuild.amazonaws.com Action: sts:AssumeRole Policies: - PolicyName: CodeCommitPushPolicy PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - codecommit:GitPull - codecommit:GitPush - codecommit:GetRepository Resource: '' - Effect: Allow Action: - logs:CreateLogGroup - logs:CreateLogStream - logs:PutLogEvents - s3: Resource: '*'
+
+CodePipeline
+
+SyncPipeline: Type: AWS::CodePipeline::Pipeline Properties: Name: !Sub sync-pipeline-${AWS::StackName} RoleArn: !GetAtt PipelineRole.Arn ArtifactStore: Type: S3 Location: !Ref ArtifactBucket Stages: - Name: Source Actions: - Name: Source ActionTypeId: Category: Source Owner: AWS Provider: CodeCommit Version: '1' Configuration: RepositoryName: !Ref RepositoryAName BranchName: !Ref SourceBranch OutputArtifacts: - Name: SourceArtifact RunOrder: 1
+
+- Name: Approval
+      Actions:
+        - Name: ManualApproval
+          ActionTypeId:
+            Category: Approval
+            Owner: AWS
+            Provider: Manual
+            Version: '1'
+          Configuration:
+            CustomData: "需要 GitApproval 用户组成员手动批准"
+          RunOrder: 1
+
+    - Name: DeployToB
+      Actions:
+        - Name: SyncToB
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: '1'
+          InputArtifacts:
+            - Name: SourceArtifact
+          Configuration:
+            ProjectName: !Ref SyncBuildProject
+          RunOrder: 1
+
+CodePipeline 角色
+
+PipelineRole: Type: AWS::IAM::Role Properties: RoleName: !Sub pipeline-role-${AWS::StackName} AssumeRolePolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Principal: Service: codepipeline.amazonaws.com Action: sts:AssumeRole Policies: - PolicyName: CodePipelinePolicy PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - codecommit:Get* - codecommit:GitPull - codecommit:GitPush - codebuild:BatchGetBuilds - codebuild:StartBuild - codebuild:BatchGetProjects - iam:PassRole - s3:GetObject - s3:PutObject - s3:GetBucketVersioning - logs:* Resource: '*'
+
