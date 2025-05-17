@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: '2010-09-09' Description: > 在 B 账号中部署：自动创建 CodeCommit 仓库、初始化分支，并创建供 A 账号使用的 IAM 用户（带 Access Key）
+
+Parameters: RepositoryName: Type: String Description: CodeCommit 仓库名称
+
+RepositoryRegion: Type: String Default: ap-northeast-1 Description: 仓库部署区域，默认东京
+
+GitUserName: Type: String Default: A-SyncUser Description: 用于跨账号 Git 推送的 IAM 用户名
+
+TargetBranch: Type: String Default: prod Description: 初始化的目标分支名
+
+Resources: CodeCommitRepo: Type: AWS::CodeCommit::Repository Properties: RepositoryName: !Ref RepositoryName RepositoryDescription: 用于接收 A 账号同步的仓库
+
+GitUser: Type: AWS::IAM::User Properties: UserName: !Ref GitUserName Policies: - PolicyName: GitLimitedAccess PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - codecommit:GetRepository - codecommit:GitPull - codecommit:GitPush Resource: !Sub arn:aws:codecommit:${RepositoryRegion}:${AWS::AccountId}:${RepositoryName}
+
+GitUserAccessKey: Type: AWS::IAM::AccessKey Properties: UserName: !Ref GitUser
+
+Outputs: GitUserAccessKeyId: Description: B 账号 Git 用户的 Access Key ID（请复制保存） Value: !Ref GitUserAccessKey
+
+GitUserSecretAccessKey: Description: B 账号 Git 用户的 Secret Access Key（仅显示一次，请妥善保存） Value: !GetAtt GitUserAccessKey.SecretAccessKey
+
+CodeCommitRepositoryURL: Description: CodeCommit HTTPS 仓库地址 Value: !Sub https://git-codecommit.${RepositoryRegion}.amazonaws.com/v1/repos/${RepositoryName}
+
+Metadata: AWS::CloudFormation::Interface: ParameterGroups: - Label: default: CodeCommit 仓库设置 Parameters: - RepositoryName - RepositoryRegion - TargetBranch - Label: default: IAM 用户设置 Parameters: - GitUserName ParameterLabels: RepositoryName: default: 仓库名称 RepositoryRegion: default: 仓库区域 GitUserName: default: IAM 用户名 TargetBranch: default: 初始化分支
+
