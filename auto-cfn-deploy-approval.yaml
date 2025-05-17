@@ -1,79 +1,46 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  CodePipeline triggered by S3 upload of .yaml/.json templates with enhanced error handling and notifications.
-  Includes manual approval, CloudFormation deployment, rollback support, email notifications, and Lambda-based Change Set summary notifications.
+  Pipeline to deploy CloudFormation templates uploaded to S3,
+  with manual approval and environment-based naming.
 
 Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    Description: Environment name prefix (e.g., dev, prod)
   S3BucketName:
     Type: String
-    Default: BucketName
-    Description: S3 bucket for CloudFormation templates
-  EmailAddress:
-    Type: String
-    Description: Email for manual approval and failure notifications
-  ApprovalGroupName:
-    Type: String
-    Default: PipelineApprovers
-    Description: IAM group name for the approvers
-  TopicName:
-    Type: String
-    Default: CodePipelineApprovalTopic
-    Description: SNS Topic name for approval notifications
-  PipelineName:
-    Type: String
-    Default: AutoCfnPipeline
-    Description: Name of the CodePipeline
-  EventRuleName:
-    Type: String
-    Default: TemplateUploadEventRule
-    Description: EventBridge rule name to trigger pipeline
+    Default: ' '
+    Description: Globally unique S3 bucket name for template uploads
+# NotificationEmail:
+#   Type: String
+#   Default: ' '
+#   Description: Email address for manual approval notifications
 
 Resources:
-  # S3 Bucket for CloudFormation templates
-  TemplateBucket:
+  # S3 bucket with versioning and lifecycle rule
+  S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
-          - Status: Enabled
+          - Id: AutoDelete
+            Status: Enabled
             ExpirationInDays: 90
-            Prefix: Template/
+            Prefix: ""
+            NoncurrentVersionExpirationInDays: 90
 
-  # IAM group for approvers (optional logic-level reference, not enforced in pipeline)
-  ApprovalGroup:
-    Type: AWS::IAM::Group
-    Properties:
-      GroupName: !Ref ApprovalGroupName
-
-  # SNS topic for sending manual approval notifications
-  ApproverTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Ref TopicName
-      Subscription:
-        - Endpoint: !Ref EmailAddress
-          Protocol: email
-
-  # Lambda function to notify change set summary
-  LambdaChangeSetNotifier:
-    Type: AWS::Lambda::Function
-    Properties:
-      Handler: index.handler
-      Role: !GetAtt LambdaExecutionRole.Arn
-      FunctionName: NotifyChangeSetSummary
-      Code:
-        S3Bucket: !Ref S3BucketName
-        S3Key: lambda/code/changeSetNotifier.zip
-      Runtime: python3.8
-      Environment:
-        Variables:
-          TOPIC_ARN: !Ref ApproverTopic
-
-  # Lambda execution role
+  # IAM role for Lambda
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvName}-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -81,44 +48,121 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
-        - PolicyName: LambdaChangeSetNotifierPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - cloudformation:DescribeChangeSet
-                  - sns:Publish
-                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
 
-  # IAM Role for CloudFormation deployment with least privileges
-  CFNExecutionRole:
-    Type: AWS::IAM::Role
+  # Lambda function that processes uploaded YAML/JSON to create/update CFN stacks
+  ProcessFileFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: cloudformation.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: CFNPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - cloudformation:*
-                  - iam:GetRole
-                  - iam:PassRole
-                Resource: '*'
+      FunctionName: !Sub '${EnvName}-cfn-deploy'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.parse
 
-  # IAM Role for CodePipeline execution
+          def handler(event, context):
+              print("Event received:", json.dumps(event))
+
+              codepipeline = boto3.client('codepipeline')
+              s3 = boto3.client('s3')
+              cfn = boto3.client('cloudformation')
+
+              expected_bucket = os.environ.get('S3_BUCKET_NAME')
+              env_prefix = os.environ.get('ENV_PREFIX', '')
+
+              try:
+                  job_id = event['CodePipeline.job']['id']
+                  artifact = event['CodePipeline.job']['data']['inputArtifacts'][0]
+                  artifact_location = artifact['location']['s3Location']
+                  artifact_bucket = artifact_location['bucketName']
+                  artifact_key = artifact_location['objectKey']
+
+                  if artifact_bucket != expected_bucket:
+                      print(f"Ignoring event from unexpected bucket: {artifact_bucket}")
+                      codepipeline.put_job_success_result(jobId=job_id)
+                      return
+
+              except Exception as e:
+                  print("Failed to parse CodePipeline event:", e)
+                  codepipeline.put_job_failure_result(jobId=job_id, failureDetails={
+                      'message': str(e),
+                      'type': 'JobFailed'
+                  })
+                  raise
+
+              if not (artifact_key.endswith('.yaml') or artifact_key.endswith('.yml') or artifact_key.endswith('.json')):
+                  print(f'Skipping unsupported file: {artifact_key}')
+                  codepipeline.put_job_success_result(jobId=job_id)
+                  return
+
+              try:
+                  response = s3.get_object(Bucket=artifact_bucket, Key=artifact_key)
+                  content = response['Body'].read().decode('utf-8')
+
+                  filename = os.path.splitext(os.path.basename(artifact_key))[0]
+                  stack_name = f"{env_prefix}-{filename}" if env_prefix else filename
+
+                  if artifact_key.endswith('.json'):
+                      template_body = json.dumps(json.loads(content))
+                  else:
+                      template_body = content
+
+                  try:
+                      cfn.describe_stacks(StackName=stack_name)
+                      print(f'Updating stack: {stack_name}')
+                      cfn.update_stack(
+                          StackName=stack_name,
+                          TemplateBody=template_body,
+                          Capabilities=['CAPABILITY_NAMED_IAM']
+                      )
+                      waiter = cfn.get_waiter('stack_update_complete')
+                  except cfn.exceptions.ClientError as e:
+                      if 'does not exist' in str(e):
+                          print(f'Creating stack: {stack_name}')
+                          cfn.create_stack(
+                              StackName=stack_name,
+                              TemplateBody=template_body,
+                              Capabilities=['CAPABILITY_NAMED_IAM']
+                          )
+                          waiter = cfn.get_waiter('stack_create_complete')
+                      elif 'No updates are to be performed' in str(e):
+                          print(f"No changes detected in stack: {stack_name}")
+                          codepipeline.put_job_success_result(jobId=job_id)
+                          return
+                      else:
+                          raise
+
+                  print(f"Waiting for stack operation to complete...")
+                  waiter.wait(StackName=stack_name)
+                  print(f"Stack operation completed: {stack_name}")
+
+                  codepipeline.put_job_success_result(jobId=job_id)
+
+              except Exception as e:
+                  print(f'Error processing file {artifact_key}: {e}')
+                  codepipeline.put_job_failure_result(jobId=job_id, failureDetails={
+                      'message': str(e),
+                      'type': 'JobFailed'
+                  })
+                  raise
+
+
+  # IAM role for CodePipeline
   PipelineRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvName}-cfn-pp-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -126,31 +170,40 @@ Resources:
             Principal:
               Service: codepipeline.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
       Policies:
-        - PolicyName: PipelinePolicy
+        - PolicyName: PipelineAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                  - s3:PutObject
-                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
-              - Effect: Allow
-                Action: iam:PassRole
+                  - lambda:*
                 Resource: '*'
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
               - Effect: Allow
-                Action: cloudformation:*
-                Resource: '*'
-              - Effect: Allow
-                Action: sns:Publish
+                Action:
+                  - sns:Publish
                 Resource: '*'
 
-  # Main CodePipeline definition
+  # SNS topic to send approval requests via email
+# ApprovalTopic:
+#   Type: AWS::SNS::Topic
+#   Properties:
+#     TopicName: !Sub '${EnvName}-approval-topic'
+#     Subscription:
+#       - Protocol: email
+#         Endpoint: !Ref NotificationEmail
+
+  # CodePipeline connecting source, manual approval, and Lambda deploy
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
+      Name: !Sub '${EnvName}-pipeline'
       RoleArn: !GetAtt PipelineRole.Arn
       ArtifactStore:
         Type: S3
@@ -166,10 +219,10 @@ Resources:
                 Version: 1
               Configuration:
                 S3Bucket: !Ref S3BucketName
-                S3ObjectKey: !Sub 'Template/${EventBridgeTriggerKey}'
-                PollForSourceChanges: false
+                S3ObjectKey: template.yaml
+                PollForSourceChanges: 'false'  # Disabled: EventBridge triggers pipeline
               OutputArtifacts:
-                - Name: SourceArtifact
+                - Name: SourceOutput
               RunOrder: 1
 
         - Name: Approval
@@ -180,44 +233,30 @@ Resources:
                 Owner: AWS
                 Provider: Manual
                 Version: 1
-              Configuration:
-                NotificationArn: !Ref ApproverTopic
-                CustomData: "Please approve the CloudFormation deployment."
+#             Configuration:
+#               NotificationArn: !Ref ApprovalTopic
+#               CustomData: Please review and approve deployment of the uploaded CloudFormation template.
               RunOrder: 1
 
         - Name: Deploy
           Actions:
-            - Name: DeployWithCfn
-              ActionTypeId:
-                Category: Deploy
-                Owner: AWS
-                Provider: CloudFormation
-                Version: 1
-              Configuration:
-                ActionMode: CREATE_UPDATE
-                StackName: DynamicStack
-                TemplatePath: !Sub "SourceArtifact::Template/${EventBridgeTriggerKey}"
-                Capabilities: CAPABILITY_NAMED_IAM
-                RoleArn: !GetAtt CFNExecutionRole.Arn
-              RunOrder: 1
-
-        - Name: NotifyChangeSetSummary
-          Actions:
-            - Name: NotifyChangeSet
+            - Name: RunLambda
               ActionTypeId:
                 Category: Invoke
                 Owner: AWS
                 Provider: Lambda
                 Version: 1
               Configuration:
-                FunctionName: !Ref LambdaChangeSetNotifier
-                UserParameters: '{"ChangeSetName": "${ChangeSetName}", "StackName": "DynamicStack"}'
+                FunctionName: !Ref ProcessFileFunction
+              InputArtifacts:
+                - Name: SourceOutput
               RunOrder: 1
 
-  # IAM Role used by EventBridge to trigger pipeline execution
-  EventBridgeInvokeRole:
+  # IAM role for EventBridge to trigger CodePipeline
+  EventInvokeRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvName}-eb-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -225,20 +264,22 @@ Resources:
             Principal:
               Service: events.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
       Policies:
-        - PolicyName: AllowPipelineExecution
+        - PolicyName: InvokePipeline
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action: codepipeline:StartPipelineExecution
-                Resource: !GetAtt Pipeline.Arn
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${EnvName}-pipeline"
 
-  # EventBridge rule to detect .yaml/.json upload and trigger the pipeline
-  TemplateUploadEventRule:
+  # EventBridge rule triggers pipeline on upload of yaml/json files to the S3 bucket
+  PipelineTriggerRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Trigger pipeline when a .yaml or .json template is uploaded to S3
+      Name: !Sub '${EnvName}-pp-rule'
       EventPattern:
         source:
           - aws.s3
@@ -248,43 +289,25 @@ Resources:
           bucket:
             name:
               - !Ref S3BucketName
-          object:
-            key:
-              - prefix: Template/
-              - suffix: .yaml
-              - suffix: .json
+#         object:
+#           key:
+#             suffix:
+#               - .yaml
+#               - .yml
+#               - .json
       Targets:
-        - Arn: !GetAtt Pipeline.Arn
-          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
-          Id: CodePipelineTrigger
-          InputTransformer:
-            InputPathsMap:
-              key: $.detail.object.key
-            InputTemplate: '{"EventBridgeTriggerKey":"<key>"}'
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${EnvName}-pipeline"
+          Id: PipelineTrigger
+          RoleArn: !GetAtt EventInvokeRole.Arn
 
 Outputs:
+  BucketName:
+    Description: S3 bucket name
+    Value: !Ref S3BucketName
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref ProcessFileFunction
   PipelineName:
-    Description: Name of the created CodePipeline
+    Description: CodePipeline name
     Value: !Ref Pipeline
-    Export:
-      Name: PipelineName
-  PipelineArn:
-    Description: ARN of the CodePipeline (useful for other triggers or permissions)
-    Value: !GetAtt Pipeline.Arn
-    Export:
-      Name: PipelineArn
-  CFNExecutionRoleArn:
-    Description: ARN of the CloudFormation execution role
-    Value: !GetAtt CFNExecutionRole.Arn
-    Export:
-      Name: CFNExecutionRoleArn
-  ApproverSNSTopic:
-    Description: SNS topic ARN for approval notifications
-    Value: !Ref ApproverTopic
-    Export:
-      Name: ApproverSNSTopic
-  EventRuleName:
-    Description: Name of the EventBridge rule triggering the pipeline
-    Value: !Ref TemplateUploadEventRule
-    Export:
-      Name: TemplateUploadEventRuleName
+
