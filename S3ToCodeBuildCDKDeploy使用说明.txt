@@ -1,0 +1,63 @@
+S3ToCodeBuildCDKDeploy.yaml 使用说明
+
+概述
+本 CloudFormation 模板实现了一个自动化 CDK 部署流程，基于向 S3 上传或更新 ZIP 文件触发：
+
+创建带版本控制的 S3 存储桶，用于存放部署用 ZIP 包
+
+Lambda 函数监听 S3 上传事件，触发 CodeBuild 项目启动
+
+CodeBuild 项目负责下载 ZIP，解压，安装依赖，执行 cdk bootstrap、cdk diff 和 cdk deploy 来完成资源的首次部署或更新
+
+合理配置的 IAM 角色权限保证安全访问
+
+事件规则（EventBridge）实现 S3 事件和 Lambda 触发的联动
+
+工作流程
+上传或更新 ZIP 包到 S3 存储桶（支持版本控制）
+
+S3 触发事件规则调用 Lambda 函数
+
+Lambda 从事件中读取 ZIP 文件名和部署人信息，启动 CodeBuild 并传入环境变量
+
+CodeBuild 下载 ZIP，解压进入项目目录，安装依赖
+
+运行 cdk bootstrap 初始化环境（如果还未初始化）
+
+运行 cdk diff 输出资源变更对比（便于调试）
+
+运行 cdk deploy 部署或更新 CDK Stack
+
+部署日志中包含触发人的身份信息，便于审计和追踪
+
+参数
+CodeBuildImage (字符串，默认: aws/codebuild/standard:6.0)
+CodeBuild 运行环境镜像，支持 Node.js 18
+
+输出
+BucketName：用于上传 ZIP 文件的 S3 桶名称
+
+LambdaName：监听 S3 上传事件触发 CodeBuild 的 Lambda 函数名称
+
+CodeBuildProjectName：执行 CDK 部署的 CodeBuild 项目名称
+
+使用步骤
+通过 CloudFormation 部署本模板
+
+将包含 CDK 应用的 ZIP 文件（如 myapp.zip）上传至输出的 S3 桶
+
+部署流程自动触发
+
+在 CodeBuild 控制台查看构建日志，确认部署状态
+
+注意事项
+S3 桶启用了版本控制，支持同名 ZIP 文件的覆盖更新触发部署
+
+cdk diff 用于对比变更，不会因失败阻止后续部署
+
+代码依赖缓存提升构建效率
+
+部署触发人的身份会自动注入环境变量，便于日志审计
+
+请确保 ZIP 包中包含正确配置的 package.json 和 cdk.json 文件
+
