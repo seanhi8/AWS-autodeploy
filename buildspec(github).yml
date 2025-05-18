@@ -1,0 +1,46 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "[Install] Installing global dependencies"
+      - npm install -g aws-cdk
+      - echo "[Install] Installing project dependencies"
+      - if [ -f package.json ]; then npm install; fi
+      - if [ -f requirements.txt ]; then
+          echo "Python project detected. Installing dependencies...";
+          pip3 install -r requirements.txt || pip install -r requirements.txt;
+        fi
+
+  pre_build:
+    commands:
+      - echo "[PreBuild] ENV set to $ENV"
+      - echo "[PreBuild] Synthesizing CDK..."
+      - cdk synth
+
+  build:
+    commands:
+      - echo "[Build] Bootstrapping if necessary..."
+      - cdk bootstrap
+      - echo "[Build] Deploying CDK stacks..."
+      - |
+        set -e
+        if ! cdk deploy --require-approval never --all; then
+          echo "Error CDK deploy failed. Dumping templates for debug:"
+          find cdk.out -name "*.template.json" -exec cat {} \;
+          exit 1
+        else
+          echo "CDK deploy completed successfully"
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: yes
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+    - '.venv/**/*'
