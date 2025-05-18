@@ -1,0 +1,57 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+      python: 3.11
+    commands:
+      - echo "==== [Install Phase] ===="
+      - echo "Node.js version: $(node -v)"
+      - echo "Python version: $(python3 --version)"
+      - echo "Installing project dependencies..."
+
+      # For TypeScript CDK project: install Node.js dependencies
+      - if [ -f package.json ]; then
+          echo "Detected Node.js project. Installing npm packages...";
+          npm install;
+        fi
+
+      # For Python CDK project: install Python dependencies
+      - if [ -f requirements.txt ]; then
+          echo "Detected Python project. Installing pip packages...";
+          pip install -r requirements.txt;
+        fi
+
+      # Install AWS CDK CLI globally (if not already installed)
+      - echo "Installing AWS CDK CLI globally..."
+      - npm install -g aws-cdk
+
+  pre_build:
+    commands:
+      - echo "==== [Pre-Build Phase] ===="
+      - echo "Running cdk synth to generate CloudFormation templates..."
+      - cdk synth || { echo 'Warning CDK synth failed'; exit 1; }
+
+  build:
+    commands:
+      - echo "==== [Build Phase] ===="
+      - echo "Bootstrapping CDK environment if required..."
+      - cdk bootstrap || { echo 'Warning CDK bootstrap failed'; exit 1; }
+
+      - echo "Deploying CDK stacks..."
+      - |
+        set -e
+        if ! cdk deploy --require-approval never; then
+          echo "Warning CDK deploy failed. Dumping synth output for diagnostics:"
+          find cdk.out -name "*.template.json" -exec cat {} \;
+          exit 1
+        else
+          echo "CDK deploy succeeded"
+        fi
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: no
+
