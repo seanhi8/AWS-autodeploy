@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  S3 versioned bucket triggers Lambda, which starts CodeBuild to unzip, build, diff, and deploy CDK stack.
+
+Parameters:
+  CodeBuildImage:
+    Type: String
+    Default: "aws/codebuild/standard:6.0"
+    Description: "CodeBuild image version supporting Node.js 18"
+
+Resources:
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: 90
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${DeployBucket.Arn}/*"
+                  - !Sub "${DeployBucket.Arn}"
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - sts:AssumeRole
+                  - iam:PassRole
+                  - cdk:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - cloudwatch:PutMetricData
+                  - autoscaling:Describe*
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: CDKDeployProject
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: !Ref CodeBuildImage
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref DeployBucket
+          - Name: ZIP_OBJECT_KEY
+            Value: ""  # Overwritten dynamically by Lambda
+          - Name: DEPLOYER_NAME
+            Value: ""  # Overwritten dynamically by Lambda
+      Source:
+        Type: NO_SOURCE
+      TimeoutInMinutes: 30
+      Description: "CodeBuild project for CDK deployment from S3 ZIP"
+      BuildSpec: |
+        version: 0.2
+        phases:
+          install:
+            runtime-versions:
+              nodejs: 18
+            commands:
+              - echo Installing unzip...
+              - yum install -y unzip || true
+          pre_build:
+            commands:
+              - echo "[deploy] Current deployer: $DEPLOYER_NAME"
+              - echo Downloading zip from S3...
+              - aws s3 cp s3://$S3_BUCKET/$ZIP_OBJECT_KEY ./app.zip
+              - unzip app.zip -d ./app
+              - cd app
+          build:
+            commands:
+              - echo Running cdk bootstrap...
+              - npx cdk bootstrap
+              - echo Installing dependencies...
+              - npm install
+              - echo Running cdk diff for preview...
+              - npx cdk diff || true
+              - echo Deploying CDK stack...
+              - npx cdk deploy --require-approval=never
+        cache:
+          paths:
+            - 'app/node_modules/**/*'
+            - 'app/.npm/**/*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: LambdaInvokeCodeBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  TriggerCodeBuildLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerCDKDeployBuild
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const codebuild = new AWS.CodeBuild();
+
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            try {
+              const params = {
+                projectName: process.env.CODEBUILD_PROJECT_NAME,
+                environmentVariablesOverride: []
+              };
+              const records = event.Records || [];
+              if (records.length > 0) {
+                const s3object = records[0].s3;
+                params.environmentVariablesOverride.push({
+                  name: 'ZIP_OBJECT_KEY',
+                  value: s3object.object.key,
+                  type: 'PLAINTEXT'
+                });
+              }
+              // Auto detect IAM user from event context or fallback
+              let deployerName = 'Unknown';
+              if(event.requestContext && event.requestContext.identity && event.requestContext.identity.user) {
+                deployerName = event.requestContext.identity.user;
+              }
+              if(event.Records && event.Records[0].userIdentity && event.Records[0].userIdentity.principalId) {
+                deployerName = event.Records[0].userIdentity.principalId;
+              }
+              params.environmentVariablesOverride.push({
+                name: 'DEPLOYER_NAME',
+                value: deployerName,
+                type: 'PLAINTEXT'
+              });
+
+              const startBuildResult = await codebuild.startBuild(params).promise();
+              console.log('Started CodeBuild build:', startBuildResult);
+              return startBuildResult;
+            } catch (error) {
+              console.error(error);
+              throw error;
+            }
+          }
+      Environment:
+        Variables:
+          CODEBUILD_PROJECT_NAME: CDKDeployProject
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerCodeBuildLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Ref S3PutObjectRule
+
+  S3PutObjectRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger Lambda to start CodeBuild on S3 ZIP upload or version update"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        resources:
+          - !Sub arn:aws:s3:::${DeployBucket}
+        detail:
+          bucket:
+            name:
+              - !Ref DeployBucket
+          object:
+            key:
+              suffix: ".zip"
+      Targets:
+        - Arn: !GetAtt TriggerCodeBuildLambda.Arn
+          Id: "TriggerLambda"
+
+Outputs:
+  BucketName:
+    Description: "S3 Bucket name for uploading CDK ZIP files"
+    Value: !Ref DeployBucket
+  LambdaName:
+    Description: "Lambda function name that triggers CodeBuild"
+    Value: !Ref TriggerCodeBuildLambda
+  CodeBuildProjectName:
+    Description: "CodeBuild project name"
+    Value: !Ref CodeBuildProject
+
