@@ -1,0 +1,134 @@
+🧰 一、前置环境准备（本地机器）
+你需要以下环境准备好：
+
+工具	安装命令
+Node.js (≥ 16)	https://nodejs.org/
+AWS CLI	brew install awscli 或 sudo dnf install awscli
+CDK CLI	npm install -g aws-cdk
+TypeScript	npm install -g typescript
+ts-node	npm install -g ts-node
+
+验证：
+
+bash
+复制
+编辑
+node -v
+aws --version
+cdk --version
+tsc --version
+🌍 二、配置 AWS 本地凭证
+使用 AWS CLI 登录你的账户（只需一次）：
+
+bash
+复制
+编辑
+aws configure
+输入以下信息：
+
+pgsql
+复制
+编辑
+AWS Access Key ID     [None]: <你的访问密钥>
+AWS Secret Access Key [None]: <你的密钥>
+Default region name   [None]: ap-northeast-1（或 cn-north-1 等）
+Default output format [None]: json
+✅ 确保你有 CloudFormation、IAM、S3、CodePipeline、CodeBuild 权限。
+
+🏗️ 三、本地部署测试（推荐先做本地验证）
+克隆或进入项目目录：
+
+bash
+复制
+编辑
+cd my-cdk-app
+安装依赖：
+
+bash
+复制
+编辑
+npm install
+合成 CloudFormation 模板（检查是否构建成功）：
+
+bash
+复制
+编辑
+cdk synth
+可选：列出可部署的栈：
+
+bash
+复制
+编辑
+cdk ls
+CDK Bootstrapping（首次部署 AWS CDK 必需）：
+
+bash
+复制
+编辑
+cdk bootstrap
+部署所有栈到默认账户/区域：
+
+bash
+复制
+编辑
+cdk deploy --all --require-approval never
+☁️ 四、云端自动部署（CI/CD）
+✅ 前提：你已部署前述的 CloudFormation 模板
+该模板创建了以下内容：
+
+S3 存储 bucket（artifact）
+
+CodeCommit 源代码仓库（如：demo-repo-dev）
+
+CodeBuild 构建项目
+
+CodePipeline 自动构建+部署流程
+
+🚀 步骤一：推送代码到 CodeCommit
+克隆你在模板中设定的 CodeCommit 仓库：
+
+bash
+复制
+编辑
+git clone codecommit::ap-northeast-1://demo-repo-dev
+cd demo-repo-dev
+把本地代码拷贝进去，添加并推送：
+
+bash
+复制
+编辑
+cp -r ../my-cdk-app/* .
+git add .
+git commit -m "Initial CDK project"
+git push origin dev
+⚙️ 步骤二：CodePipeline 自动触发
+你模板中配置了 CloudWatch Event Rule，当 dev 分支有 push 时会：
+
+自动触发 Pipeline
+
+执行 Build（即 buildspec.yml）
+
+部署 CDK 栈
+
+你可以在 CodePipeline 控制台 找到并监控整个流程。
+
+📦 五、（可选）多环境部署（dev/stg/prod）
+更换 ENV 参数：
+在你部署 CloudFormation 模板时传入：
+
+bash
+复制
+编辑
+aws cloudformation deploy \
+  --template-file my-pipeline.yaml \
+  --stack-name demo-pipeline \
+  --parameter-overrides EnvName=prod RepoName=demo-repo-prod BranchName=prod \
+  --capabilities CAPABILITY_NAMED_IAM
+然后将代码推送到 prod 分支。
+
+✅ 结果验证
+在 CloudFormation 控制台看到你 CDK 定义的资源栈。
+
+在 CodePipeline 控制台可以查看 pipeline 执行日志。
+
+在 S3、Lambda、Step Functions 等控制台验证资源是否成功创建。
