@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CodePipeline for CDK project that listens to a single main branch,
+  with manual approval, and CodeBuild performing build & deploy.
+  Environment variable ENV is passed dynamically to CodeBuild.
+  Logs retention days parameterized.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: dev
+    Description: Environment name passed as ENV variable to CodeBuild (e.g. dev,stg,prod)
+  RepoName:
+    Default: demo-repo-dev
+    Description: CodeCommit repository name to monitor
+  BranchName:
+    Type: String
+    Default: dev
+    Description: Main branch name to monitor (e.g. main,master,dev,stg)
+  LogRetentionDays:
+    Type: Number
+    Default: 60
+    AllowedValues: [1,3,5,7,14,30,60,90,120,150,180,365]
+    Description: Number of days to retain CloudWatch logs
+
+Resources:
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtifactsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+    DeletionPolicy: Retain
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${RepoName}-${BranchName}-build
+      RetentionInDays: !Ref LogRetentionDays
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RepoName}-BuildRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - codecommit:GitPull
+                  - cloudformation:*
+                  - sts:AssumeRole
+                  - iam:PassRole
+                Resource: "*"
+
+  CDKBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${RepoName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ENV
+            Value: !Ref EnvName
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref PipelineLogGroup
+          StreamName: build-log
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: CODEPIPELINE
+      Cache:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      BuildSpec: !Sub |
+        version: 0.2
+        phases:
+          install:
+            commands:
+              - echo "Detecting project language and installing dependencies..."
+              - npm install -g aws-cdk
+              - if [ -f package.json ]; then
+                  echo "Node.js project detected, installing npm dependencies...";
+                  npm install;
+                fi
+              - if [ -f requirements.txt ]; then
+                  echo "Python project detected, installing pip dependencies...";
+                  if command -v pip3 > /dev/null 2>&1; then
+                    pip3 install -r requirements.txt;
+                  elif command -v pip > /dev/null 2>&1; then
+                    pip install -r requirements.txt;
+                  else
+                    echo "No pip or pip3 found, skipping Python dependencies installation.";
+                  fi
+                fi
+
+          pre_build:
+            commands:
+              - echo "Environment variable ENV is set to: $ENV"
+              - echo "Synthesizing CDK app..."
+              - cdk synth || { echo "Warning: CDK synth failed"; exit 1; }
+
+          build:
+            commands:
+              - echo "Bootstrapping CDK environment if needed..."
+              - cdk bootstrap || { echo "Warning: CDK bootstrap failed"; exit 1; }
+              - echo "Listing all CDK stacks..."
+              - cdk ls
+              - echo "Deploying all CDK stacks for environment: $ENV"
+              - |
+                set -e
+                if ! cdk deploy --require-approval never --all; then
+                  echo "Warning: CDK deploy failed. Printing diagnostics:"
+                  find cdk.out -name "*.template.json" -exec cat {} \;
+                  exit 1
+                else
+                  echo "CDK deploy succeeded"
+                fi
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RepoName}-PipelineRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - codecommit:*
+                  - codebuild:*
+                  - iam:PassRole
+                  - codepipeline:StartPipelineExecution
+                Resource: "*"
+
+  CDKPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${RepoName}-pipeline
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              OutputArtifacts:
+                - Name: SourceOutput
+              Configuration:
+                RepositoryName: !Ref RepoName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+              RunOrder: 1
+
+        - Name: Approve
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              RunOrder: 1
+
+        - Name: BuildAndDeploy
+          Actions:
+            - Name: BuildAndDeployCDK
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              Configuration:
+                ProjectName: !Ref CDKBuildProject
+              RunOrder: 1
+
+  CodeCommitTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${RepoName}-${BranchName}-branch-trigger
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Sub arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepoName}
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CDKPipeline}
+          RoleArn: !GetAtt PipelineRole.Arn
+          Id: trigger-pipeline
+
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref CDKPipeline
+  BuildProject:
+    Description: CodeBuild project name
+    Value: !Ref CDKBuildProject
+  LogGroup:
+    Description: Log group name for build logs
+    Value: !Ref PipelineLogGroup
+  ArtifactBucket:
+    Description: S3 Bucket for pipeline artifacts
+    Value: !Ref PipelineArtifactBucket
+
