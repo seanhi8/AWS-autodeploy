@@ -224,7 +224,8 @@ Resources:
               - !Ref DeployBucket
           object:
             key:
-              suffix: ".zip"
+              suffix:
+                - ".zip"
       Targets:
         - Arn: !GetAtt TriggerCodeBuildLambda.Arn
           Id: "TriggerLambda"
