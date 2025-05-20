@@ -1,0 +1,60 @@
+A账户 CloudFormation 模板（prod桶 + S3跨账号复制配置）
+
+上传release/*.zip会自动复制到B账户的目标桶
+
+AWSTemplateFormatVersion: '2010-09-09' Description: A账号S3 prod桶及跨账号复制配置
+
+Parameters: ProdBucketName: Type: String Description: A账号中prod环境的S3桶名
+
+ReplicationRoleName: Type: String Default: S3ReplicationToB Description: 用于S3复制的IAM角色名称
+
+DestinationBucketArn: Type: String Description: B账号中目标S3桶的完整ARN，如 arn:aws:s3:::b-production-bucket
+
+DestinationAccountId: Type: String Description: B账号的AWS账号ID
+
+ProdAccessGroupName: Type: String Default: ProdUploaderGroup Description: 仅允许此组的用户可访问Prod桶
+
+Resources:
+
+ProdBucket: Type: AWS::S3::Bucket Properties: BucketName: !Ref ProdBucketName VersioningConfiguration: Status: Enabled NotificationConfiguration: {}
+
+ReplicationRole: Type: AWS::IAM::Role Properties: RoleName: !Ref ReplicationRoleName AssumeRolePolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Principal: Service: s3.amazonaws.com Action: sts:AssumeRole Policies: - PolicyName: ReplicationPolicy PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - s3:GetReplicationConfiguration - s3:ListBucket Resource: !GetAtt ProdBucket.Arn
+
+- Effect: Allow
+            Action:
+              - s3:GetObjectVersion
+              - s3:GetObjectVersionAcl
+            Resource: !Sub "${ProdBucket.Arn}/*"
+
+          - Effect: Allow
+            Action:
+              - s3:ReplicateObject
+              - s3:ReplicateDelete
+              - s3:ReplicateTags
+            Resource: !Sub "${DestinationBucketArn}/*"
+
+ReplicationConfig: Type: AWS::S3::BucketPolicy Properties: Bucket: !Ref ProdBucket PolicyDocument: Version: '2012-10-17' Statement: - Sid: AllowReplication Effect: Allow Principal: AWS: !GetAtt ReplicationRole.Arn Action: - s3:ReplicateObject - s3:ReplicateDelete - s3:ReplicateTags Resource: !Sub "${DestinationBucketArn}/*"
+
+- Sid: RestrictAccessToGroup
+        Effect: Deny
+        Principal: "*"
+        Action: s3:*
+        Resource:
+          - !Sub "arn:aws:s3:::${ProdBucketName}"
+          - !Sub "arn:aws:s3:::${ProdBucketName}/*"
+        Condition:
+          StringNotLike:
+            aws:userid: !Sub "${AWS::AccountId}:*"
+          StringNotEqualsIfExists:
+            aws:PrincipalTag/ProdUploader: "true"
+
+ProdAccessGroup: Type: AWS::IAM::Group Properties: GroupName: !Ref ProdAccessGroupName
+
+GroupAccessPolicy: Type: AWS::IAM::Policy Properties: PolicyName: ProdBucketUploaderAccess Groups: - !Ref ProdAccessGroup PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - s3:PutObject - s3:GetObject - s3:ListBucket Resource: - !Sub "arn:aws:s3:::${ProdBucketName}" - !Sub "arn:aws:s3:::${ProdBucketName}/*"
+
+ReplicationRule: Type: AWS::S3::Bucket Properties: BucketName: !Ref ProdBucketName ReplicationConfiguration: Role: !GetAtt ReplicationRole.Arn Rules: - Id: ReplicateToBAccount Status: Enabled Prefix: release/ Destination: Bucket: !Ref DestinationBucketArn Account: !Ref DestinationAccountId
+
+Outputs: SourceBucket: Description: A账户用于上传的prod桶 Value: !Ref ProdBucket
+
+AllowedUploaderGroup: Description: 拥有prod桶上传权限的IAM用户组 Value: !Ref ProdAccessGroup
+
