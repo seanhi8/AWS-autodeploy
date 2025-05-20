@@ -48,7 +48,16 @@ Resources:
                   - cloudformation:*
                   - sts:AssumeRole
                   - iam:PassRole
+                  - iam:TagRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:PutRolePolicy
                   - cdk:*
+                  - ecr:*
                 Resource: "*"
               - Effect: Allow
                 Action:
@@ -84,38 +93,41 @@ Resources:
             Value: ""  # Overwritten dynamically by Lambda
       Source:
         Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 18
+              commands:
+                - echo "Installing unzip..."
+                - yum install -y unzip || true
+            pre_build:
+              commands:
+                - echo "[deploy] Current deployer: ${DEPLOYER_NAME:-unknown}"
+                - echo "Downloading zip from S3..."
+                - aws s3 cp s3://$S3_BUCKET/$ZIP_OBJECT_KEY ./app.zip
+                - ls -lh app.zip
+                - unzip app.zip -d ./app
+                - cd app
+                - echo Installing npm dependencies...
+                - npm install
+            build:
+              commands:
+                - echo Building project...
+                - npm run build
+                - echo Running cdk bootstrap...
+                - npx cdk bootstrap
+                - echo Running cdk diff...
+                - npx cdk diff || true
+                - echo Deploying CDK stack...
+                - npx cdk deploy --require-approval=never
+          cache:
+            paths:
+              - 'app/node_modules/**/*'
+              - 'app/.npm/**/*'
       TimeoutInMinutes: 30
       Description: "CodeBuild project for CDK deployment from S3 ZIP"
-      BuildSpec: |
-        version: 0.2
-        phases:
-          install:
-            runtime-versions:
-              nodejs: 18
-            commands:
-              - echo Installing unzip...
-              - yum install -y unzip || true
-          pre_build:
-            commands:
-              - echo "[deploy] Current deployer: $DEPLOYER_NAME"
-              - echo Downloading zip from S3...
-              - aws s3 cp s3://$S3_BUCKET/$ZIP_OBJECT_KEY ./app.zip
-              - unzip app.zip -d ./app
-              - cd app
-          build:
-            commands:
-              - echo Running cdk bootstrap...
-              - npx cdk bootstrap
-              - echo Installing dependencies...
-              - npm install
-              - echo Running cdk diff for preview...
-              - npx cdk diff || true
-              - echo Deploying CDK stack...
-              - npx cdk deploy --require-approval=never
-        cache:
-          paths:
-            - 'app/node_modules/**/*'
-            - 'app/.npm/**/*'
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -148,7 +160,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: TriggerCDKDeployBuild
-      Runtime: nodejs18.x
+      Runtime: nodejs16.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 30
@@ -205,7 +217,7 @@ Resources:
       FunctionName: !Ref TriggerCodeBuildLambda
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !Ref S3PutObjectRule
+      SourceArn: !GetAtt S3PutObjectRule.Arn
 
   S3PutObjectRule:
     Type: AWS::Events::Rule
@@ -240,4 +252,3 @@ Outputs:
   CodeBuildProjectName:
     Description: "CodeBuild project name"
     Value: !Ref CodeBuildProject
-
