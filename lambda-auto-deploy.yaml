@@ -1,116 +1,271 @@
-CloudFormation Template for Multi-Environment Lambda Deployment via S3 Events
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation Template for Multi-Environment Lambda Deployment via S3 Events
 
-自动部署 Lambda 函数代码：上传 release/*.zip 到指定环境桶触发部署
+  自动部署 Lambda 函数代码：上传 release/*.zip 到指定环境桶触发部署
 
-特别说明：prod 环境需人工审批后再上传 zip 文件至 prod 桶
+  特别说明：prod 环境需人工审批后再上传 zip 文件至 prod 桶
 
-扩展功能：保留最多10个版本，超出后自动删除旧版本；支持手动指定 alias 回滚
+  扩展功能：保留最多10个版本，超出后自动删除旧版本；支持手动指定 alias 回滚
 
-AWSTemplateFormatVersion: '2010-09-09' Description: > Lambda Code Deployment via S3 Upload for multiple environments (dev1, dev2, stg, hofix, prod). Each environment has its own S3 bucket. Zip uploaded to release/ directory triggers Lambda function code update. For prod environment, manual approval is required before uploading zip to prod bucket. The system retains up to 10 published versions per Lambda function. Older versions will be deleted automatically.
+Parameters:
+  Dev1BucketName:
+    Type: String
+    Description: dev1 环境的 S3 存储桶
 
-Parameters: Dev1BucketName: Type: String Description: S3 Bucket for dev1 environment
+  Dev2BucketName:
+    Type: String
+    Description: dev2 环境的 S3 存储桶
 
-Dev2BucketName: Type: String Description: S3 Bucket for dev2 environment
+  StgBucketName:
+    Type: String
+    Description: stg 环境的 S3 存储桶
 
-StgBucketName: Type: String Description: S3 Bucket for stg environment
+  HofixBucketName:
+    Type: String
+    Description: hofix 环境的 S3 存储桶
 
-HofixBucketName: Type: String Description: S3 Bucket for hofix environment
+  ProdBucketName:
+    Type: String
+    Description: prod 环境的 S3 存储桶（需要人工审批后上传）
 
-ProdBucketName: Type: String Description: S3 Bucket for prod environment (Requires manual approval before upload)
+  LogGroupName:
+    Type: String
+    Description: Lambda 更新日志记录用的 CloudWatch Log Group 名称
 
-LogGroupName: Type: String Description: Log group name for logging Lambda deployment results
+Resources:
+  # 自动部署逻辑的主 Lambda 函数
+  LambdaUpdateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LambdaCodeUpdater
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          LOG_GROUP_NAME: !Ref LogGroupName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import zipfile
+          import tempfile
 
-Resources: LambdaUpdateFunction: Type: AWS::Lambda::Function Properties: FunctionName: LambdaCodeUpdater Handler: index.handler Runtime: python3.12 Role: !GetAtt LambdaExecutionRole.Arn Timeout: 60 MemorySize: 256 Environment: Variables: LOG_GROUP_NAME: !Ref LogGroupName Code: ZipFile: | import boto3 import os import logging import zipfile import tempfile
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
 
-logger = logging.getLogger()
-      logger.setLevel(logging.INFO)
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              lambda_client = boto3.client('lambda')
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
 
-      def handler(event, context):
-          s3 = boto3.client('s3')
-          lambda_client = boto3.client('lambda')
-          for record in event['Records']:
-              bucket = record['s3']['bucket']['name']
-              key = record['s3']['object']['key']
+                  if not key.startswith('release/') or not key.endswith('.zip'):
+                      logger.info('不是 release 目录的 zip 文件，跳过处理。')
+                      continue
 
-              if not key.startswith('release/') or not key.endswith('.zip'):
-                  logger.info('Not a release zip. Skipping.')
-                  continue
+                  function_name = key.split('/')[-1].replace('.zip', '')
+                  logger.info(f'准备更新 Lambda 函数: {function_name}')
 
-              function_name = key.split('/')[-1].replace('.zip', '')
+                  try:
+                      with tempfile.NamedTemporaryFile() as tmp_file:
+                          s3.download_fileobj(bucket, key, tmp_file)
+                          tmp_file.seek(0)
+                          zipped_code = tmp_file.read()
 
-              logger.info(f'Preparing to update Lambda: {function_name}')
-
-              try:
-                  with tempfile.NamedTemporaryFile() as tmp_file:
-                      s3.download_fileobj(bucket, key, tmp_file)
-                      tmp_file.seek(0)
-                      zipped_code = tmp_file.read()
-
-                  # Retry on failure
-                  for attempt in range(3):
-                      try:
-                          response = lambda_client.update_function_code(
-                              FunctionName=function_name,
-                              ZipFile=zipped_code,
-                              Publish=True
-                          )
-                          version = response['Version']
-                          logger.info(f'Updated Lambda {function_name} to version {version}')
-
-                          lambda_client.update_alias(
-                              FunctionName=function_name,
-                              Name='live',
-                              FunctionVersion=version
-                          )
-                          logger.info(f'Updated alias "live" to version {version}')
-                          break
-                      except Exception as inner_e:
-                          logger.error(f'Retry {attempt + 1}/3 failed: {inner_e}')
-                          if attempt == 2:
-                              raise
-
-                  # Clean up old versions (keep latest 10)
-                  versions = lambda_client.list_versions_by_function(FunctionName=function_name)['Versions']
-                  # Exclude $LATEST and sort published versions
-                  published_versions = sorted(
-                      [v for v in versions if v['Version'] not in ('$LATEST')],
-                      key=lambda v: int(v['Version'])
-                  )
-                  if len(published_versions) > 10:
-                      for v in published_versions[:-10]:
+                      for attempt in range(3):
                           try:
-                              lambda_client.delete_function(
+                              response = lambda_client.update_function_code(
                                   FunctionName=function_name,
-                                  Qualifier=v['Version']
+                                  ZipFile=zipped_code,
+                                  Publish=True
                               )
-                              logger.info(f'Deleted old version {v['Version']} of {function_name}')
-                          except Exception as e:
-                              logger.warning(f'Could not delete version {v['Version']}: {e}')
+                              version = response['Version']
+                              logger.info(f'Lambda 函数 {function_name} 成功更新到版本 {version}')
 
-              except Exception as e:
-                  logger.error(f'Lambda update failed: {str(e)}')
+                              lambda_client.update_alias(
+                                  FunctionName=function_name,
+                                  Name='live',
+                                  FunctionVersion=version
+                              )
+                              logger.info(f'alias "live" 已更新为版本 {version}')
+                              break
+                          except Exception as inner_e:
+                              logger.error(f'第 {attempt + 1}/3 次重试失败：{inner_e}')
+                              if attempt == 2:
+                                  raise
 
-LambdaExecutionRole: Type: AWS::IAM::Role Properties: RoleName: LambdaUpdateExecutionRole AssumeRolePolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Principal: Service: lambda.amazonaws.com Action: sts:AssumeRole Policies: - PolicyName: LambdaS3UpdatePolicy PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - lambda:UpdateFunctionCode - lambda:UpdateAlias - lambda:ListVersionsByFunction - lambda:DeleteFunction Resource: '' - Effect: Allow Action: - logs:CreateLogGroup - logs:CreateLogStream - logs:PutLogEvents Resource: '' - Effect: Allow Action: - s3:GetObject Resource: - !Sub arn:aws:s3:::${Dev1BucketName}/release/* - !Sub arn:aws:s3:::${Dev2BucketName}/release/* - !Sub arn:aws:s3:::${StgBucketName}/release/* - !Sub arn:aws:s3:::${HofixBucketName}/release/* - !Sub arn:aws:s3:::${ProdBucketName}/release/*
+                      versions = lambda_client.list_versions_by_function(FunctionName=function_name)['Versions']
+                      published_versions = sorted(
+                          [v for v in versions if v['Version'] != '$LATEST'],
+                          key=lambda v: int(v['Version'])
+                      )
+                      if len(published_versions) > 10:
+                          for v in published_versions[:-10]:
+                              try:
+                                  lambda_client.delete_function(
+                                      FunctionName=function_name,
+                                      Qualifier=v['Version']
+                                  )
+                                  logger.info(f'已删除旧版本 {v["Version"]} 的函数 {function_name}')
+                              except Exception as e:
+                                  logger.warning(f'无法删除版本 {v["Version"]}：{e}')
 
-LambdaLogGroup: Type: AWS::Logs::LogGroup Properties: LogGroupName: !Ref LogGroupName RetentionInDays: 14
+                  except Exception as e:
+                      logger.error(f'Lambda 更新失败：{str(e)}')
 
-S3 Event Notifications for each environment bucket
+  # Lambda 执行所需 IAM 角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaUpdateExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3UpdatePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Lambda 更新相关权限
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateAlias
+                  - lambda:ListVersionsByFunction
+                  - lambda:DeleteFunction
+                Resource: '*'
 
-Dev1Notification: Type: AWS::S3::BucketNotification Properties: Bucket: !Ref Dev1BucketName NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdateFunction.Arn
+              # 日志权限
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
 
-Dev2Notification: Type: AWS::S3::BucketNotification Properties: Bucket: !Ref Dev2BucketName NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdateFunction.Arn
+              # 允许访问所有环境的 S3 release 路径
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${Dev1BucketName}/release/*
+                  - !Sub arn:aws:s3:::${Dev2BucketName}/release/*
+                  - !Sub arn:aws:s3:::${StgBucketName}/release/*
+                  - !Sub arn:aws:s3:::${HofixBucketName}/release/*
+                  - !Sub arn:aws:s3:::${ProdBucketName}/release/*
 
-StgNotification: Type: AWS::S3::BucketNotification Properties: Bucket: !Ref StgBucketName NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdateFunction.Arn
+  # 日志组定义
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 14
 
-HofixNotification: Type: AWS::S3::BucketNotification Properties: Bucket: !Ref HofixBucketName NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdateFunction.Arn
+  # S3 Bucket 通知（每个环境）
 
-ProdNotification: Type: AWS::S3::BucketNotification Properties: Bucket: !Ref ProdBucketName NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdateFunction.Arn
+  Dev1Notification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref Dev1BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: release/
+                  - Name: suffix
+                    Value: .zip
+            Function: !GetAtt LambdaUpdateFunction.Arn
 
-Outputs: LambdaUpdater: Description: Lambda function that performs code update and alias switching Value: !Ref LambdaUpdateFunction
+  Dev2Notification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref Dev2BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: release/
+                  - Name: suffix
+                    Value: .zip
+            Function: !GetAtt LambdaUpdateFunction.Arn
 
-LogGroup: Description: Log group for Lambda updater logs Value: !Ref LambdaLogGroup
+  StgNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref StgBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: release/
+                  - Name: suffix
+                    Value: .zip
+            Function: !GetAtt LambdaUpdateFunction.Arn
 
-ProdDeploymentNote: Description: Manual approval required before uploading to prod bucket Value: 'Please review and manually upload approved ZIP to prod bucket: release/*.zip'
+  HofixNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref HofixBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: release/
+                  - Name: suffix
+                    Value: .zip
+            Function: !GetAtt LambdaUpdateFunction.Arn
 
-ManualRollbackInstruction: Description: > To rollback a Lambda to a previous version, manually run: aws lambda update-alias --function-name <name> --name live --function-version <version>
+  ProdNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref ProdBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: release/
+                  - Name: suffix
+                    Value: .zip
+            Function: !GetAtt LambdaUpdateFunction.Arn
 
+Outputs:
+  LambdaUpdater:
+    Description: 自动更新 Lambda 函数的主 Lambda
+    Value: !Ref LambdaUpdateFunction
+
+  LogGroup:
+    Description: 用于记录部署日志的 CloudWatch 日志组
+    Value: !Ref LambdaLogGroup
+
+  ProdDeploymentNote:
+    Description: 提示 prod 环境需人工上传 zip 文件
+    Value: '请审批后手动上传 ZIP 到 prod bucket 的 release/ 目录中'
+
+  ManualRollbackInstruction:
+    Description: 手动将 alias 回滚到旧版本命令行指令
+    Value: 'aws lambda update-alias --function-name <name> --name live --function-version <version>'
