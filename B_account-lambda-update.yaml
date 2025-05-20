@@ -1,0 +1,85 @@
+B账户模板：接收ZIP并更新Lambda函数
+
+AWSTemplateFormatVersion: '2010-09-09' Description: 接收A账户同步的ZIP，自动更新Lambda函数代码并管理版本
+
+Parameters: EnvBucketName: Type: String Description: B账户中用于prod的S3 bucket名称（接收A同步文件）
+
+LogGroupName: Type: String Description: CloudWatch 日志组名称
+
+LambdaUpdateFunctionName: Type: String Description: 用于处理ZIP并更新目标Lambda的函数名
+
+Resources:
+
+ProdBucket: Type: AWS::S3::Bucket Properties: BucketName: !Ref EnvBucketName NotificationConfiguration: {}
+
+LogGroup: Type: AWS::Logs::LogGroup Properties: LogGroupName: !Ref LogGroupName RetentionInDays: 30
+
+LambdaExecutionRole: Type: AWS::IAM::Role Properties: RoleName: !Sub LambdaUpdateRole-${AWS::StackName} AssumeRolePolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Principal: Service: lambda.amazonaws.com Action: sts:AssumeRole Policies: - PolicyName: LambdaS3UpdatePolicy PolicyDocument: Version: '2012-10-17' Statement: - Effect: Allow Action: - logs:CreateLogStream - logs:PutLogEvents Resource: '' - Effect: Allow Action: - s3:GetObject Resource: !Sub "arn:aws:s3:::${EnvBucketName}/release/" - Effect: Allow Action: - lambda:UpdateFunctionCode - lambda:PublishVersion - lambda:UpdateAlias - lambda:ListVersionsByFunction - lambda:DeleteFunction Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+
+LambdaUpdater: Type: AWS::Lambda::Function Properties: FunctionName: !Ref LambdaUpdateFunctionName Handler: index.handler Role: !GetAtt LambdaExecutionRole.Arn Runtime: python3.11 Timeout: 120 Code: ZipFile: | import boto3, os, json import zipfile import io
+
+def handler(event, context):
+          s3 = boto3.client('s3')
+          lambda_client = boto3.client('lambda')
+
+          for record in event['Records']:
+              bucket = record['s3']['bucket']['name']
+              key = record['s3']['object']['key']
+
+              if not key.startswith('release/') or not key.endswith('.zip'):
+                  continue
+
+              func_name = os.path.splitext(os.path.basename(key))[0]
+
+              response = s3.get_object(Bucket=bucket, Key=key)
+              code_bytes = response['Body'].read()
+
+              print(f"Updating function: {func_name} with {key}")
+
+              lambda_client.update_function_code(
+                  FunctionName=func_name,
+                  ZipFile=code_bytes,
+                  Publish=True
+              )
+
+              # 更新 alias 指向新版本
+              versions = lambda_client.list_versions_by_function(FunctionName=func_name)['Versions']
+              versions = [v for v in versions if v['Version'] != '$LATEST']
+              latest = sorted(versions, key=lambda x: int(x['Version']))[-1]
+
+              try:
+                  lambda_client.update_alias(
+                      FunctionName=func_name,
+                      Name='live',
+                      FunctionVersion=latest['Version']
+                  )
+              except lambda_client.exceptions.ResourceNotFoundException:
+                  lambda_client.create_alias(
+                      FunctionName=func_name,
+                      Name='live',
+                      FunctionVersion=latest['Version'],
+                      Description='Auto updated by ZIP deploy'
+                  )
+
+              # 删除旧版本（保留最新10个）
+              keep = sorted(versions, key=lambda x: int(x['Version']), reverse=True)[:10]
+              to_delete = [v for v in versions if v not in keep]
+
+              for v in to_delete:
+                  print(f"Deleting old version: {v['Version']}")
+                  try:
+                      lambda_client.delete_function(
+                          FunctionName=func_name,
+                          Qualifier=v['Version']
+                      )
+                  except Exception as e:
+                      print(f"Failed to delete version {v['Version']}: {e}")
+
+BucketNotification: Type: AWS::S3::BucketNotification DependsOn: LambdaUpdater Properties: Bucket: !Ref ProdBucket NotificationConfiguration: LambdaConfigurations: - Event: s3:ObjectCreated:* Filter: S3Key: Rules: - Name: prefix Value: release/ - Name: suffix Value: .zip Function: !GetAtt LambdaUpdater.Arn
+
+PermissionToInvoke: Type: AWS::Lambda::Permission Properties: Action: lambda:InvokeFunction FunctionName: !Ref LambdaUpdateFunctionName Principal: s3.amazonaws.com SourceArn: !Sub arn:aws:s3:::${EnvBucketName}
+
+Outputs: BucketName: Value: !Ref ProdBucket Description: B账户用于接收prod ZIP的桶
+
+LambdaFunctionName: Value: !Ref LambdaUpdateFunctionName Description: 自动处理ZIP更新Lambda的函数名
+
