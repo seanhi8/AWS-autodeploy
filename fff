@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  S3 versioned bucket triggers Lambda, which writes bucket name to SSM, then starts CodeBuild that reads from SSM to deploy CDK stack.
+  S3 versioned bucket triggers Lambda, which writes object info to Parameter Store, then starts CodeBuild to deploy CDK.
 
 Parameters:
   CodeBuildImage:
@@ -14,18 +14,22 @@ Resources:
     Properties:
       VersioningConfiguration:
         Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Status: Enabled
-            ExpirationInDays: 90
 
-  DeployBucketParameter:
+  S3BucketParameter:
     Type: AWS::SSM::Parameter
     Properties:
       Name: /cdk/deploy/bucket
       Type: String
-      Value: !Ref DeployBucket
-      Description: "S3 Bucket name for CDK deployment ZIPs"
+      Value: ""
+      Description: "Latest S3 bucket name for deployment artifact"
+
+  S3ObjectKeyParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cdk/deploy/object
+      Type: String
+      Value: ""
+      Description: "Latest uploaded ZIP object key for deployment"
 
   CodeBuildServiceRole:
     Type: AWS::IAM::Role
@@ -48,32 +52,22 @@ Resources:
                   - s3:GetObject
                   - s3:GetObjectVersion
                   - s3:ListBucket
-                Resource:
-                  - !Sub "${DeployBucket.Arn}/*"
-                  - !Sub "${DeployBucket.Arn}"
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - ssm:GetParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk/deploy/bucket
+                Resource: "*"
               - Effect: Allow
                 Action:
+                  - logs:*
+                  - ec2:Describe*
+                  - cloudwatch:PutMetricData
+                  - autoscaling:Describe*
                   - cloudformation:*
                   - sts:AssumeRole
                   - iam:*
                   - cdk:*
                   - ecr:*
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - ec2:Describe*
-                  - cloudwatch:PutMetricData
-                  - autoscaling:Describe*
                 Resource: "*"
 
   CodeBuildProject:
@@ -88,51 +82,38 @@ Resources:
         Image: !Ref CodeBuildImage
         ComputeType: BUILD_GENERAL1_SMALL
         PrivilegedMode: false
-        EnvironmentVariables:
-          - Name: ZIP_OBJECT_KEY
-            Value: ""
-          - Name: DEPLOYER_NAME
-            Value: ""
+        EnvironmentVariables: []
       Source:
         Type: NO_SOURCE
-        BuildSpec: !Sub |
+        BuildSpec: |
           version: 0.2
           phases:
             install:
               runtime-versions:
                 nodejs: 18
               commands:
-                - echo "Installing unzip..."
                 - yum install -y unzip || true
             pre_build:
               commands:
-                - echo "Fetching bucket name from SSM..."
+                - echo "[Info] Fetching parameters from SSM..."
                 - S3_BUCKET=$(aws ssm get-parameter --name /cdk/deploy/bucket --query "Parameter.Value" --output text)
-                - echo "Using S3 bucket: $S3_BUCKET"
-                - echo "[deploy] Current deployer: ${DEPLOYER_NAME:-unknown}"
-                - echo "Downloading zip from S3..."
-                - aws s3 cp s3://$S3_BUCKET/$ZIP_OBJECT_KEY ./app.zip
-                - ls -lh app.zip
+                - ZIP_KEY=$(aws ssm get-parameter --name /cdk/deploy/object --query "Parameter.Value" --output text)
+                - echo "[Info] Downloading $ZIP_KEY from $S3_BUCKET"
+                - aws s3 cp s3://$S3_BUCKET/$ZIP_KEY ./app.zip
                 - unzip app.zip -d ./app
                 - cd app
-                - echo Installing npm dependencies...
                 - npm install
             build:
               commands:
-                - echo Building project...
                 - npm run build
-                - echo Running cdk bootstrap...
                 - npx cdk bootstrap
-                - echo Running cdk diff...
                 - npx cdk diff || true
-                - echo Deploying CDK stack...
                 - npx cdk deploy --require-approval=never
           cache:
             paths:
               - 'app/node_modules/**/*'
               - 'app/.npm/**/*'
       TimeoutInMinutes: 30
-      Description: "CodeBuild project for CDK deployment from S3 ZIP"
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -146,7 +127,7 @@ Resources:
             Action: sts:AssumeRole
       Path: /
       Policies:
-        - PolicyName: LambdaInvokeCodeBuild
+        - PolicyName: LambdaInvokeAndWriteSSM
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -157,7 +138,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - ssm:PutParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk/deploy/bucket
+                Resource: "*"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
@@ -169,61 +150,43 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: TriggerCDKDeployBuild
-      Runtime: nodejs16.x
+      Runtime: nodejs18.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 30
       Code:
         ZipFile: |
           const AWS = require('aws-sdk');
-          const codebuild = new AWS.CodeBuild();
           const ssm = new AWS.SSM();
+          const codebuild = new AWS.CodeBuild();
 
           exports.handler = async (event) => {
-            console.log('Received event:', JSON.stringify(event, null, 2));
-            try {
-              const params = {
-                projectName: process.env.CODEBUILD_PROJECT_NAME,
-                environmentVariablesOverride: []
-              };
-              const records = event.Records || [];
-              if (records.length > 0) {
-                const s3object = records[0].s3;
-                const bucketName = s3object.bucket.name;
-                const objectKey = s3object.object.key;
+            console.log('Received S3 event:', JSON.stringify(event, null, 2));
+            const record = event.Records[0];
+            const bucketName = record.s3.bucket.name;
+            const objectKey = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
 
-                await ssm.putParameter({
-                  Name: '/cdk/deploy/bucket',
-                  Value: bucketName,
-                  Overwrite: true,
-                  Type: 'String'
-                }).promise();
+            // Write SSM parameters
+            await ssm.putParameter({
+              Name: '/cdk/deploy/bucket',
+              Value: bucketName,
+              Overwrite: true,
+              Type: 'String'
+            }).promise();
 
-                params.environmentVariablesOverride.push({
-                  name: 'ZIP_OBJECT_KEY',
-                  value: objectKey,
-                  type: 'PLAINTEXT'
-                });
-              }
+            await ssm.putParameter({
+              Name: '/cdk/deploy/object',
+              Value: objectKey,
+              Overwrite: true,
+              Type: 'String'
+            }).promise();
 
-              let deployerName = 'Unknown';
-              if(event.Records?.[0]?.userIdentity?.principalId) {
-                deployerName = event.Records[0].userIdentity.principalId;
-              }
-
-              params.environmentVariablesOverride.push({
-                name: 'DEPLOYER_NAME',
-                value: deployerName,
-                type: 'PLAINTEXT'
-              });
-
-              const startBuildResult = await codebuild.startBuild(params).promise();
-              console.log('Started CodeBuild build:', startBuildResult);
-              return startBuildResult;
-            } catch (error) {
-              console.error(error);
-              throw error;
-            }
+            // Start build
+            const buildParams = {
+              projectName: process.env.CODEBUILD_PROJECT_NAME
+            };
+            const result = await codebuild.startBuild(buildParams).promise();
+            console.log('Build started:', result);
           }
       Environment:
         Variables:
@@ -240,7 +203,7 @@ Resources:
   S3PutObjectRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: "Trigger Lambda to start CodeBuild on S3 ZIP upload or version update"
+      Description: "Trigger Lambda to start CodeBuild on S3 ZIP upload"
       EventPattern:
         source:
           - aws.s3
@@ -261,12 +224,12 @@ Resources:
           Id: "TriggerLambda"
 
 Outputs:
-  BucketName:ssss
-    Description: "S3 Bucket name for uploading CDK ZIP files"
+  BucketName:
+    Description: "S3 Bucket name for uploading ZIPs"
     Value: !Ref DeployBucket
-  LambdaName:
-    Description: "Lambda function name that triggers CodeBuild"
-    Value: !Ref TriggerCodeBuildLambda
   CodeBuildProjectName:
-    Description: "CodeBuild project name"
+    Description: "CodeBuild project"
     Value: !Ref CodeBuildProject
+  LambdaName:
+    Description: "Trigger Lambda name"
+    Value: !Ref TriggerCodeBuildLambda
