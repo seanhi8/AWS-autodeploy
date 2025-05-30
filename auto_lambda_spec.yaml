@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09' Description: > Lambda Auto Memory Tuning System Automatically analyzes Lambda memory usage and recommends or applies changes.
+
+Parameters: AutoTuneEnabled: Type: String Default: true AllowedValues: [true, false] Description: Global toggle for memory auto-tuning (can be overridden by function tags)
+
+Resources: AutoTuneFunction: Type: AWS::Lambda::Function Properties: FunctionName: lambda-autotune Runtime: python3.12 Handler: index.lambda_handler Role: arn:aws:iam::123456789012:role/lambda-autotune-role # Replace with your actual role ARN Timeout: 60 Environment: Variables: AUTO_TUNE_ENABLED: !Ref AutoTuneEnabled Code: ZipFile: | import boto3 import json import os from datetime import datetime, timedelta
+
+def lambda_handler(event, context):
+          functions = event.get('functions', [])
+          topic_arn = event['topic_arn']
+          bucket = event['bucket']
+          alias = event.get('alias', 'live')
+          global_do_tune = str(os.environ.get('AUTO_TUNE_ENABLED', 'true')).lower() == 'true'
+
+          for fn in functions:
+              analyze_and_tune(fn, topic_arn, bucket, alias, global_do_tune)
+
+      def analyze_and_tune(fn, topic_arn, bucket, alias, global_do_tune):
+          cw = boto3.client('cloudwatch')
+          client = boto3.client('lambda')
+          end = datetime.utcnow()
+          start = end - timedelta(hours=12)
+
+          mem_resp = cw.get_metric_statistics(
+              Namespace='AWS/Lambda',
+              MetricName='MaxMemoryUsed',
+              Dimensions=[{'Name': 'FunctionName', 'Value': fn}],
+              StartTime=start,
+              EndTime=end,
+              Period=3600,
+              Statistics=['Maximum']
+          )
+          duration_resp = cw.get_metric_statistics(
+              Namespace='AWS/Lambda',
+              MetricName='Duration',
+              Dimensions=[{'Name': 'FunctionName', 'Value': fn}],
+              StartTime=start,
+              EndTime=end,
+              Period=3600,
+              Statistics=['Average']
+          )
+
+          max_mem = max([pt['Maximum'] for pt in mem_resp['Datapoints']], default=0)
+          avg_dur = sum([pt['Average'] for pt in duration_resp['Datapoints']]) / max(len(duration_resp['Datapoints']), 1)
+
+          conf = client.get_function_configuration(FunctionName=fn)
+          current_mem = conf['MemorySize']
+          new_mem = current_mem
+
+          if max_mem > current_mem * 0.85:
+              new_mem = min(current_mem + 256, 10240)
+          elif max_mem < current_mem * 0.4 and current_mem > 128:
+              new_mem = max(current_mem - 128, 128)
+
+          current_cost = current_mem * avg_dur / 1024 / 1000
+          new_cost = new_mem * avg_dur / 1024 / 1000
+          delta_cost = new_cost - current_cost
+
+          fn_arn = client.get_function(FunctionName=fn)['Configuration']['FunctionArn']
+          tags = client.list_tags(Resource=fn_arn).get('Tags', {})
+          fn_do_tune = tags.get('AutoTuneEnabled', str(global_do_tune)).lower() == 'true'
+          dry_run = tags.get('AutoTuneMode', 'adjust').lower() == 'preview'
+
+          message = {
+              'Function': fn,
+              'CurrentMemory': current_mem,
+              'MaxMemoryUsed': max_mem,
+              'AvgDuration': avg_dur,
+              'NewMemory': new_mem,
+              'AutoTune': fn_do_tune,
+              'DryRun': dry_run,
+              'CurrentCostEst': round(current_cost, 4),
+              'NewCostEst': round(new_cost, 4),
+              'CostDelta': round(delta_cost, 4)
+          }
+
+          if fn_do_tune and not dry_run and new_mem != current_mem:
+              client.update_function_configuration(FunctionName=fn, MemorySize=new_mem)
+              version = client.publish_version(FunctionName=fn)['Version']
+              try:
+                  client.update_alias(FunctionName=fn, Name=alias, FunctionVersion=version)
+              except client.exceptions.ResourceNotFoundException:
+                  client.create_alias(FunctionName=fn, Name=alias, FunctionVersion=version)
+              message['Version'] = version
+
+          boto3.client('sns').publish(
+              TopicArn=topic_arn,
+              Subject=f"[AutoTune] Lambda memory {'preview' if dry_run else 'adjust'}: {fn}",
+              Message=json.dumps(message, indent=2)
+          )
+
+          key = f"lambda-memory-history/{fn}/{datetime.utcnow().isoformat()}.json"
+          boto3.client('s3').put_object(
+              Bucket=bucket,
+              Key=key,
+              Body=json.dumps(message, indent=2).encode(),
+              ContentType='application/json'
+          )
+
+AutoTuneTopic: Type: AWS::SNS::Topic Properties: DisplayName: LambdaAutoTuneNotifications TopicName: lambda-autotune-topic
+
+AutoTuneBucket: Type: AWS::S3::Bucket Properties: BucketName: !Sub lambda-autotune-${AWS::AccountId}-${AWS::Region} VersioningConfiguration: Status: Enabled
+
+AutoTuneSchedule: Type: AWS::Events::Rule Properties: ScheduleExpression: rate(6 hours) State: ENABLED Targets: - Arn: !GetAtt AutoTuneFunction.Arn Id: LambdaAutoTuneTarget Input: !Sub | { "functions": ["example-lambda-1", "example-lambda-2"], "topic_arn": "${AutoTuneTopic}", "bucket": "${AutoTuneBucket}" }
+
+AutoTunePermission: Type: AWS::Lambda::Permission Properties: FunctionName: !Ref AutoTuneFunction Action: lambda:InvokeFunction Principal: events.amazonaws.com SourceArn: !GetAtt AutoTuneSchedule.Arn
+
+Outputs: AutoTuneFunctionName: Description: Name of the Lambda AutoTune function Value: !Ref AutoTuneFunction
+
+AutoTuneSNSTopic: Description: SNS Topic used for notifications Value: !Ref AutoTuneTopic
+
+AutoTuneS3Bucket: Description: S3 Bucket storing memory tuning logs Value: !Ref AutoTuneBucket
+
