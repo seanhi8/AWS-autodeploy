@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CI/CD pipeline for GitLab with environment based branch selection.
+  When EnvironmentName=stg, pipeline tracks GitLab stg branch;
+  When EnvironmentName=prd, pipeline tracks GitLab prd branch.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: Deployment environment
+    AllowedValues:
+      - stg
+      - prd
+  GitLabTokenParameterName:
+    Type: String
+    Description: SSM Parameter path for GitLab token (with decryption)
+  GitLabRepoUrl:
+    Type: String
+    Description: GitLab repo HTTPS URL without token prefix, e.g. gitlab.com/your-org/your-repo.git
+  GitLabBranch:
+    Type: String
+    Default: ''
+    Description: Optional override branch; if empty, defaults to EnvironmentName param
+
+Conditions:
+  UseDefaultBranch: !Equals [!Ref GitLabBranch, '']
+
+Resources:
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "ci-cd-artifacts-${AWS::AccountId}-${EnvironmentName}"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CodePipelineRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodePipelineFullAccess
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CodeBuildRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitLabTokenParameterName}"
+              - Effect: Allow
+                Action:
+                  - "cloudformation:*"
+                  - "iam:*"
+                  - "sts:*"
+                  - "logs:*"
+                  - "s3:*"
+                  - "codebuild:*"
+                  - "ec2:*"
+                  - "lambda:*"
+                  - "events:*"
+                  - "cloudwatch:*"
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "GitLabCdkBuild-${EnvironmentName}"
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            variables:
+              ENVIRONMENT: ${EnvironmentName}
+              GITLAB_REPO_URL: ${GitLabRepoUrl}
+              GITLAB_BRANCH: !If
+                - UseDefaultBranch
+                - ${EnvironmentName}
+                - ${GitLabBranch}
+              GITLAB_TOKEN_PARAM: ${GitLabTokenParameterName}
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 18
+              commands:
+                - echo Installing dependencies...
+                - npm install -g aws-cdk
+                - npm install
+            pre_build:
+              commands:
+                - echo Getting GitLab token from SSM Parameter Store...
+                - export GITLAB_TOKEN=$(aws ssm get-parameter --name $GITLAB_TOKEN_PARAM --with-decryption --query Parameter.Value --output text)
+                - echo Cloning GitLab repo branch $GITLAB_BRANCH...
+                - git clone --branch $GITLAB_BRANCH https://oauth2:$GITLAB_TOKEN@${GITLAB_REPO_URL} source
+                - cd source
+            build:
+              commands:
+                - echo Deploying CDK stack for env $ENVIRONMENT...
+                - cdk bootstrap aws://$AWS_ACCOUNT_ID/$AWS_REGION --require-approval never
+                - cdk deploy --require-approval never --all -c env=$ENVIRONMENT
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref EnvironmentName
+          - Name: GITLAB_REPO_URL
+            Value: !Ref GitLabRepoUrl
+          - Name: GITLAB_BRANCH
+            Value: !If
+              - UseDefaultBranch
+              - !Ref EnvironmentName
+              - !Ref GitLabBranch
+          - Name: GITLAB_TOKEN_PARAM
+            Value: !Ref GitLabTokenParameterName
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      TimeoutInMinutes: 30
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "GitLabTriggeredPipeline-${EnvironmentName}"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: DummySource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: dummy.zip
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: DummyOutput
+        - Name: Build
+          Actions:
+            - Name: CDKDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: DummyOutput
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+
+  WebhookLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "WebhookLambdaRole-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartPipelinePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:GitLabTriggeredPipeline-${EnvironmentName}"
+
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "GitLabWebhookLambda-${EnvironmentName}"
+      Role: !GetAtt WebhookLambdaExecutionRole.Arn
+      Runtime: python3.9
+      Handler: index.handler
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          client = boto3.client('codepipeline')
+          def handler(event, context):
+              env_param = event.get('queryStringParameters', {}).get('env', 'stg')
+              pipeline_name = f"GitLabTriggeredPipeline-{env_param}"
+              try:
+                  resp = client.start_pipeline_execution(name=pipeline_name)
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Pipeline started', 'pipelineExecutionId': resp['pipelineExecutionId']})
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "GitLabWebhookApi-${EnvironmentName}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: webhook
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - Region: !Ref AWS::Region
+            LambdaArn: !GetAtt WebhookLambda.Arn
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/webhook"
+
+Outputs:
+  WebhookInvokeURL:
+    Description: "Invoke URL for GitLab webhook"
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook"
+
+
+----------------------------
+说明
+传入参数 EnvironmentName （stg 或 prd），决定 pipeline 和 CodeBuild 配置。
+
+CodeBuild 内嵌 buildspec 会读取对应分支：默认用 ${EnvironmentName} 作为 GitLab 分支名。
+
+Webhook Lambda 根据 query 参数 env 触发对应 pipeline，例如：
+
+https://.../webhook?env=stg 触发 GitLabTriggeredPipeline-stg
+
+https://.../webhook?env=prd 触发 GitLabTriggeredPipeline-prd
+
+你需要在 GitLab webhook 配置中填入对应 URL，确保触发事件传递正确参数。
+
+你也可以用 GitLabBranch 参数覆盖默认分支名。
+
+请预先在 SSM Parameter Store 中存储 GitLab 访问 Token。
+
