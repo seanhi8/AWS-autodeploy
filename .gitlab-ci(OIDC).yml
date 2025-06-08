@@ -1,0 +1,39 @@
+stages:
+  - deploy
+
+variables:
+  AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/GitLab-OIDC-Role"
+  AWS_REGION: "ap-northeast-1"
+  DEPLOY_ENV: "stg"
+
+deploy:
+  stage: deploy
+  image: node:18-bullseye
+
+  id_tokens:
+    OIDC_TOKEN:
+      aud: "https://gitlab.com"
+
+  before_script:
+    - apt-get update && apt-get install -y curl unzip jq awscli
+    - echo "OIDC_TOKEN length:" $(echo "$OIDC_TOKEN" | wc -c)
+    - echo "$OIDC_TOKEN" > /tmp/gitlab_oidc_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/gitlab_oidc_token
+    - export AWS_ROLE_ARN="$AWS_ROLE_ARN"
+    - export AWS_DEFAULT_REGION="$AWS_REGION"
+    - echo "Verifying AWS credentials"
+    - aws sts get-caller-identity
+
+  script:
+    - npm install -g aws-cdk
+    - cd my-cdk-app
+    - npm install
+    - npm run build
+    - export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - cdk bootstrap aws://$ACCOUNT_ID/$AWS_REGION --require-approval never
+    - cdk deploy --all -c env=$DEPLOY_ENV --require-approval never
+
+  only:
+    - main
+    - stg
+    - prd
