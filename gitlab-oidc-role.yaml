@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Setup IAM Role and OIDC Provider for GitLab CI/CD Integration
+
+Parameters:
+  GitLabThumbprint:
+    Type: String
+    Default: 7908e16a2e36b7a3e2535ec5c5f8c5cfa3b5a4e2
+    Description: SHA-1 thumbprint of GitLab's root certificate
+  GitLabProjectPath:
+    Type: String
+    Default: my-company/my-web-app
+    Description: GitLab project path (e.g., my-company/my-web-app)
+  GitLabEnvironment:
+    Type: String
+    Default: "*"
+    Description: GitLab environment (branch or tag name), e.g. stg or *
+  RoleName:
+    Type: String
+    Default: GitLab-OIDC-Role
+    Description: IAM role name to create for GitLab OIDC access
+
+Resources:
+  GitLabOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://gitlab.com
+      ClientIdList:
+        - https://gitlab.com
+      ThumbprintList:
+        - !Ref GitLabThumbprint
+
+  GitLabOIDCRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: IAM Role for GitLab CI/CD with OIDC federation
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitLabOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringLike:
+                gitlab.com:sub: !Sub "project_path:${GitLabProjectPath}:ref_type:branch:ref:${GitLabEnvironment}"
+              StringEquals:
+                gitlab.com:aud: https://gitlab.com
+      Policies:
+        - PolicyName: GitLabOIDCPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - s3:*
+                  - iam:PassRole
+                  - iam:GetRole
+                  - ec2:Describe*
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: "*"
+
+Outputs:
+  OIDCProviderArn:
+    Description: ARN of the OIDC provider
+    Value: !Ref GitLabOIDCProvider
+  GitLabRoleArn:
+    Description: IAM Role ARN to be assumed by GitLab CI/CD
+    Value: !GetAtt GitLabOIDCRole.Arn
