@@ -1,0 +1,43 @@
+stages:
+  - deploy
+
+variables:
+  # AWS_ACCESS_KEY_ID: "xxx"
+  # AWS_SECRET_ACCESS_KEY: "xxx"
+  # AWS_ACCOUNT_ID: "123456789012"
+  # AWS_REGION: "ap-northeast-1"
+  # DEPLOY_ENV: "stg"
+
+deploy:
+  stage: deploy
+  image: node:18-bullseye
+  before_script:
+    - apt-get update && apt-get install -y jq awscli
+  script:
+    - echo "Export AWS credentials from CI environment variables"
+    - export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+    - export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+    - export AWS_DEFAULT_REGION=$AWS_REGION
+
+    - echo "Verify AWS credentials by calling sts get-caller-identity"
+    - aws sts get-caller-identity
+
+    - echo "Installing AWS CDK and project dependencies"
+    - npm install -g aws-cdk
+    - cd my-cdk-app  # target folder
+    - npm install
+    - npm run build
+
+    - echo "Bootstrapping CDK environment"
+    - cdk bootstrap aws://$AWS_ACCOUNT_ID/$AWS_REGION --require-approval never
+
+    - echo "Preview CDK diff (changes to be deployed)"
+    - cdk diff -c env=$DEPLOY_ENV || true
+
+    - echo "Deploying CDK stacks"
+    - cdk deploy --all -c env=$DEPLOY_ENV --require-approval never
+
+  only:
+    - main
+    - stg
+    - prd
